@@ -12,7 +12,7 @@ const registry =
         requiredEnvironmentVariable("CONTRACT_ADDRESS"),
       )
     : new CertificateRegistry();
-const app = createApp(registry);
+const app = createApp(registry, process.env.ADMIN_API_KEY);
 
 function requiredEnvironmentVariable(name: string): string {
   const value = process.env[name];

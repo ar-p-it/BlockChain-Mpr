@@ -15,6 +15,23 @@ export function createCertificateRouter(
 ): Router {
   const router = Router();
 
+  router.get("/", async (request, response) => {
+    const issuer = typeof request.query.issuer === "string"
+      ? request.query.issuer.trim()
+      : "";
+    if (!issuer) {
+      response.status(400).json({ error: "issuer query parameter is required" });
+      return;
+    }
+    try {
+      response.json({ certificates: await registry.listByIssuer(issuer) });
+    } catch (error) {
+      response.status(502).json({
+        error: error instanceof Error ? error.message : "Unable to load history",
+      });
+    }
+  });
+
   router.post("/", async (request, response) => {
     try {
       const result = createCertificateSchema.safeParse(request.body);

@@ -27,6 +27,7 @@ The application supports:
 - Rejecting unauthorized issuers.
 - Optional direct transaction signing through MetaMask.
 - A local demo mode that works without MetaMask.
+- QR-code generation and camera-based certificate verification.
 
 ## Architecture
 
@@ -153,7 +154,9 @@ Institution browser -> MetaMask -> Smart contract
 
 The private key is not sent to the frontend or backend.
 
-MetaMask is optional in the current project. Without it, local demo mode uses the configured backend wallet so the main application can still be demonstrated easily.
+MetaMask is required for institution issuance in blockchain mode. The
+connected approved institution wallet signs the issuance transaction directly;
+the backend is not an issuance relay.
 
 ### 5. Access control
 
@@ -266,6 +269,11 @@ GET /health
 
 ### Issue a certificate
 
+In blockchain mode, institution issuance is performed directly from the
+approved institution wallet in MetaMask. The backend `POST` endpoint is not an
+issuance relay and returns an error if called in chain mode. It remains
+available for in-memory API tests.
+
 ```http
 POST /api/certificates
 Content-Type: application/json
@@ -294,6 +302,85 @@ GET /api/certificates/:id/verify
 ```http
 POST /api/certificates/:id/revoke
 ```
+
+## Admin role API
+
+The first role-management slice exposes the administrator operations through the backend service layer. In blockchain mode, these calls are submitted by the configured backend wallet, and the Solidity contract enforces that this wallet is the administrator.
+
+Read the administrator address:
+
+```http
+GET /api/admin
+```
+
+Check whether an institution is approved:
+
+```http
+GET /api/admin/institutions/:address
+```
+
+Approve or remove an institution:
+
+```http
+PUT /api/admin/institutions/:address
+Content-Type: application/json
+```
+
+Request body:
+
+```json
+{
+  "approved": true
+}
+```
+
+The endpoint does not bypass the contract's `onlyAdministrator` modifier. If the configured backend wallet is not the contract administrator, the blockchain transaction is rejected.
+
+### Institution portal and audit details
+
+The institution portal displays the configured issuer's approval status and
+certificate history. Blockchain-mode history is reconstructed from the
+`CertificateIssued` contract events, so it remains available after a server
+restart.
+
+Successful blockchain issuance, revocation, and institution-approval responses
+include transaction metadata:
+
+```json
+{
+  "hash": "0x...",
+  "blockNumber": 7,
+  "contractAddress": "0x..."
+}
+```
+
+In-memory mode now mirrors the contract's access rule: an issuer must first be
+approved through the admin API before it can issue a certificate.
+
+### Administrator activity and API protection
+
+The Admin Controls view includes an activity feed built from the contract
+events:
+
+```http
+GET /api/admin/activity
+```
+
+It shows institution approvals, certificate issuance, and certificate
+revocation events with their block numbers and transaction hashes.
+
+When `ADMIN_API_KEY` is configured, approval changes require this header:
+
+```http
+PUT /api/admin/institutions/:address
+x-admin-key: <ADMIN_API_KEY>
+```
+
+Requests without the key receive `401 Admin authentication required`.
+Read-only administrator and institution status endpoints remain available for
+the local demonstration. The API key is intended for local/demo protection;
+production deployments should use wallet signature authentication or an
+identity provider rather than exposing a static browser key.
 
 ## Local setup
 
@@ -350,7 +437,9 @@ CONTRACT_ADDRESS=YOUR_CONTRACT_ADDRESS \
 npx hardhat run scripts/approve-institution.ts --network localhost
 ```
 
-For the local demo fallback, the configured backend wallet is normally the first Hardhat account. Do not commit private keys or real credentials.
+The configured backend wallet deploys and administers the contract. Institution
+issuance uses the approved wallet connected through MetaMask. Do not commit
+private keys or real credentials.
 
 ### Configure environment variables
 
@@ -362,6 +451,7 @@ BLOCKCHAIN_MODE=chain
 RPC_URL=http://127.0.0.1:8545
 CONTRACT_ADDRESS=YOUR_CONTRACT_ADDRESS
 BACKEND_PRIVATE_KEY=YOUR_LOCAL_DEVELOPMENT_PRIVATE_KEY
+ADMIN_API_KEY=YOUR_LOCAL_ADMIN_KEY
 ```
 
 Create `frontend/.env`:
@@ -369,6 +459,7 @@ Create `frontend/.env`:
 ```env
 VITE_CONTRACT_ADDRESS=YOUR_CONTRACT_ADDRESS
 VITE_DEMO_ISSUER_ADDRESS=YOUR_BACKEND_WALLET_ADDRESS
+VITE_ADMIN_API_KEY=YOUR_LOCAL_ADMIN_KEY
 ```
 
 The `.env` files are ignored by Git. Keep private keys only in local environment files or a secure secret manager.
@@ -408,7 +499,7 @@ http://127.0.0.1:5173
 
 1. Open the frontend.
 2. Select **Institution portal**.
-3. Leave MetaMask disconnected for the simple local demo.
+3. Connect the approved institution wallet through MetaMask.
 4. Enter:
 
 ```text
@@ -417,8 +508,8 @@ Graduate identifier hash: graduate-001
 Certificate document hash: certificate-document-001
 ```
 
-5. Click **Issue certificate**.
-6. The backend sends an `issueCertificate` transaction.
+5. Click **Issue certificate** and approve the MetaMask transaction.
+6. The connected institution wallet sends the `issueCertificate` transaction.
 7. The page displays the generated certificate ID.
 
 ### Demonstration 2: Verify the certificate
@@ -450,13 +541,45 @@ Not currently valid
 
 Explain that the record was not deleted. The blockchain retains the certificate record and its status transition.
 
-### Demonstration 4: Show expiration
+### Demonstration 4: Manage institutions as administrator
+
+1. Select **Admin controls**.
+2. Confirm that the administrator wallet is displayed.
+3. Enter an institution wallet address.
+4. Click **Check status**.
+5. Click **Approve institution** and show the transaction hash and block number.
+6. Click **Remove approval**, then approve it again for the remaining demo.
+7. Open the **Administrator activity** feed.
+8. Filter by `Institution approvals` and search for the institution address.
+
+Explain the role separation:
+
+- The administrator manages which institutions may issue certificates.
+- Approved institutions issue certificates.
+- The public can verify certificates without administrator access.
+- The smart contract enforces approval independently of the frontend.
+
+### Demonstration 5: Show the activity audit trail
+
+In **Admin controls**, use the activity feed to show:
+
+- Institution approval events.
+- Certificate issuance events.
+- Certificate revocation events.
+- The actor wallet, block number, and transaction hash.
+
+Use the event-type filter to switch between approval, issuance, and revocation.
+Use the search box to find a certificate ID or transaction hash. This is the
+strongest evidence that the application is recording blockchain state changes
+rather than only changing frontend labels.
+
+### Demonstration 6: Show expiration
 
 For a separate certificate, choose a future expiration date. After the date passes, verification reports `EXPIRED`. The contract rejects an expiration date that is already in the past at issuance time.
 
-### Demonstration 5: Show MetaMask signing
+### Demonstration 7: Show MetaMask signing
 
-For Experiment 4:
+MetaMask is required for institution issuance in blockchain mode:
 
 1. Add a local MetaMask network:
 
@@ -473,7 +596,66 @@ Currency: ETH
 5. Click **Connect MetaMask**.
 6. Issue a certificate and approve the transaction in MetaMask.
 
+If an unapproved wallet is connected, the issue form remains disabled. The
+smart contract also rejects direct attempts from unapproved wallets.
+
 Always check that MetaMask is on **Hardhat Local**, not Ethereum Mainnet. Local Hardhat accounts and contract addresses are for development only.
+
+### Demonstration 8: Verify with a QR code
+
+After issuing a certificate, the institution card displays a QR code containing a URL like:
+
+```text
+http://127.0.0.1:5173/?certificateId=certificate-id
+```
+
+The QR code contains only the certificate ID and verification URL. It does not contain the certificate's private data. Scanning the code opens the verification page, which calls the existing verification API and reads the current status from the blockchain.
+
+To test the camera scanner:
+
+1. Open the frontend in a browser that can access a camera.
+2. Select **Verify a certificate**.
+3. Click **Scan QR code**.
+4. Allow camera permission.
+5. Point the camera at the QR code shown on an issued certificate.
+
+The page extracts `certificateId` from the scanned URL and displays `ACTIVE`, `EXPIRED`, or `REVOKED`. Camera access generally requires `localhost`, `127.0.0.1`, or HTTPS.
+
+## Five-minute presentation checklist
+
+Use this sequence when demonstrating the project:
+
+1. Start Hardhat and deploy the contract.
+2. Approve the demo issuer wallet.
+3. Start the backend and frontend.
+4. Open **Admin controls** and show the administrator address.
+5. Approve an institution and point out its transaction hash and block number.
+6. Open **Institution portal** and show `Approved`.
+7. Issue one certificate.
+8. Copy its certificate ID and verify it as `ACTIVE`.
+9. Return to the institution portal and revoke it.
+10. Verify the same ID as `REVOKED`.
+11. Return to **Admin controls**, filter activity by certificate revocation, and show the immutable event trail.
+
+Presentation talking points:
+
+- Hashes identify certificate data without storing the original document.
+- The smart contract enforces institution approval and certificate rules.
+- Issuance and revocation are blockchain transactions.
+- Verification is read-only and can be performed by anyone with the ID.
+- Revocation changes status; it does not erase the historical record.
+- The backend API is a convenience layer, while the contract is the authoritative registry.
+
+## Troubleshooting the local demo
+
+| Symptom | Check |
+| --- | --- |
+| `EADDRINUSE` on port 8545 | A Hardhat node is already running; do not start a second one. |
+| `could not decode result data` | The configured contract address belongs to a different chain state; redeploy and update both `.env` files. |
+| `Institution is not approved` | Approve the exact issuer wallet used by the backend or MetaMask. |
+| `401 Admin authentication required` | Set matching `ADMIN_API_KEY` and `VITE_ADMIN_API_KEY`, then restart both servers. |
+| MetaMask warns about risk | Confirm the network is Hardhat Local with chain ID `31337`, never Mainnet. |
+| QR link does not open on a phone | `127.0.0.1` refers to the scanning device; use a shared LAN/HTTPS URL for cross-device testing. |
 
 ## Testing and validation
 
@@ -500,6 +682,9 @@ The tests cover:
 
 - Approved institution issuance.
 - Rejection of unapproved issuance.
+- Administrator approval and removal.
+- Rejection of admin mutations without the API key.
+- Administrator activity retrieval.
 - Issuer revocation.
 - Future expiration storage.
 - API issuance and verification.
@@ -591,11 +776,9 @@ Current limitations:
 - The API does not yet provide authentication or rate limiting.
 - Certificate hashes are integrity identifiers, not encryption.
 - The administrator remains a trusted authority.
-- QR-code generation is not currently included.
 
 Possible future features:
 
-- QR-code verification links.
 - PDF certificate generation.
 - Transaction hash and block-number display.
 - Admin dashboard for institution approval.

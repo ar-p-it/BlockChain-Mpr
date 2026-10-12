@@ -3,9 +3,11 @@ import express from "express";
 import { CertificateRegistry } from "./services/certificateRegistry";
 import type { CertificateRegistryPort } from "./services/registry";
 import { createCertificateRouter } from "./routes/certificates";
+import { createAdminRouter } from "./routes/admin";
 
 export function createApp(
   registry: CertificateRegistryPort = new CertificateRegistry(),
+  adminApiKey?: string,
 ) {
   const app = express();
 
@@ -17,6 +19,7 @@ export function createApp(
   });
 
   app.use("/api/certificates", createCertificateRouter(registry));
+  app.use("/api/admin", createAdminRouter(registry, adminApiKey));
 
   return app;
 }

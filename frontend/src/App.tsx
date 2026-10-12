@@ -1,10 +1,12 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 import {
   BrowserProvider,
   Contract,
   keccak256,
   toUtf8Bytes,
 } from "ethers";
+import { Html5Qrcode } from "html5-qrcode";
+import { QRCodeCanvas } from "qrcode.react";
 
 declare global {
   interface Window {
@@ -19,6 +21,10 @@ declare global {
 
 const registryAbi = [
   "function issueCertificate(bytes32 certificateId, bytes32 certificateHash, bytes32 recipientHash, string skillName, uint256 expiresAt)",
+  "function revokeCertificate(bytes32 certificateId)",
+  "function administrator() view returns (address)",
+  "function approvedInstitutions(address) view returns (bool)",
+  "function setInstitutionApproval(address, bool)",
 ];
 
 type Status = "ACTIVE" | "REVOKED" | "EXPIRED";
@@ -32,6 +38,23 @@ type Certificate = {
   issuedAt: string;
   expiresAt: string | null;
   revokedAt: string | null;
+  transaction?: TransactionInfo;
+};
+
+type TransactionInfo = {
+  hash: string;
+  blockNumber: number;
+  contractAddress: string;
+};
+
+type ActivityEvent = {
+  type: "INSTITUTION_APPROVAL" | "CERTIFICATE_ISSUED" | "CERTIFICATE_REVOKED";
+  timestamp: string;
+  institution?: string;
+  approved?: boolean;
+  certificateId?: string;
+  actor?: string;
+  transaction: TransactionInfo;
 };
 
 type Verification = {
@@ -54,8 +77,13 @@ function toBytes32(value: string): string {
     : keccak256(toUtf8Bytes(value));
 }
 
+function adminRequestInit(): RequestInit {
+  const key = import.meta.env.VITE_ADMIN_API_KEY;
+  return key ? { headers: { "x-admin-key": key } } : {};
+}
+
 function App() {
-  const [view, setView] = useState<"verify" | "issue">("verify");
+  const [view, setView] = useState<"verify" | "issue" | "admin">("verify");
   const [certificateId, setCertificateId] = useState("");
   const [verification, setVerification] = useState<Verification | null>(null);
   const [issueForm, setIssueForm] = useState(emptyIssueForm);
@@ -64,6 +92,23 @@ function App() {
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const [walletAddress, setWalletAddress] = useState("");
+  const [scannerOpen, setScannerOpen] = useState(false);
+  const [administrator, setAdministrator] = useState("");
+  const [institutionAddress, setInstitutionAddress] = useState(
+    import.meta.env.VITE_DEMO_ISSUER_ADDRESS || "",
+  );
+  const [institutionApproved, setInstitutionApproved] = useState<
+    boolean | null
+  >(null);
+  const [adminMessage, setAdminMessage] = useState("");
+  const [adminTransaction, setAdminTransaction] = useState<TransactionInfo | null>(null);
+  const [activity, setActivity] = useState<ActivityEvent[]>([]);
+  const [activityType, setActivityType] = useState<"ALL" | ActivityEvent["type"]>(
+    "ALL",
+  );
+  const [activitySearch, setActivitySearch] = useState("");
+  const [institutionHistory, setInstitutionHistory] = useState<Certificate[]>([]);
+  const [institutionStatus, setInstitutionStatus] = useState<boolean | null>(null);
 
   async function connectWallet(): Promise<string> {
     if (!window.ethereum) {
@@ -76,19 +121,32 @@ function App() {
     const address = await signer.getAddress();
     setWalletAddress(address);
     setIssueForm((current) => ({ ...current, issuer: address }));
+    await loadInstitutionHistory(address, address);
     return address;
   }
 
-  async function verify(event: FormEvent) {
-    event.preventDefault();
-    if (!certificateId.trim()) return;
+  async function readInstitutionApproval(address: string): Promise<boolean> {
+    if (!window.ethereum) {
+      throw new Error("MetaMask is required to check institution access.");
+    }
+    const provider = new BrowserProvider(window.ethereum);
+    const contract = new Contract(
+      import.meta.env.VITE_CONTRACT_ADDRESS,
+      registryAbi,
+      provider,
+    );
+    return Boolean(await contract.approvedInstitutions(address));
+  }
+
+  const verifyCertificate = useCallback(async (id: string) => {
+    if (!id.trim()) return;
     setLoading(true);
     setMessage("");
     setVerification(null);
 
     try {
       const response = await fetch(
-        `/api/certificates/${certificateId.trim()}/verify`,
+        `/api/certificates/${encodeURIComponent(id.trim())}/verify`,
       );
       const data = await response.json();
       if (!response.ok) throw new Error(data.error ?? "Certificate not found");
@@ -100,7 +158,22 @@ function App() {
     } finally {
       setLoading(false);
     }
+  }, []);
+
+  async function verify(event: FormEvent) {
+    event.preventDefault();
+    await verifyCertificate(certificateId);
   }
+
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get(
+      "certificateId",
+    );
+    if (id) {
+      setCertificateId(id);
+      void verifyCertificate(id);
+    }
+  }, [verifyCertificate]);
 
   async function issue(event: FormEvent) {
     event.preventDefault();
@@ -109,28 +182,9 @@ function App() {
     setIssuedCertificate(null);
 
     try {
-      if (!walletAddress) {
-        const issuer = import.meta.env.VITE_DEMO_ISSUER_ADDRESS;
-        if (!issuer) {
-          throw new Error("VITE_DEMO_ISSUER_ADDRESS is not configured.");
-        }
-        const response = await fetch("/api/certificates", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            ...issueForm,
-            issuer,
-            expiresAt: issueForm.expiresAt
-              ? new Date(issueForm.expiresAt).toISOString()
-              : null,
-          }),
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.error ?? "Issuance failed");
-        setIssuedCertificate(data.certificate);
-        setIssueForm(emptyIssueForm);
-        setMessage("Certificate issued in local demo mode.");
-        return;
+      if (!walletAddress) throw new Error("Connect an institution wallet first.");
+      if (!(await readInstitutionApproval(walletAddress))) {
+        throw new Error("This wallet is not an approved institution.");
       }
 
       const address = walletAddress;
@@ -170,12 +224,39 @@ function App() {
       const data = await response.json();
       if (!response.ok) throw new Error(data.error ?? "Verification failed");
       setIssuedCertificate(data.certificate);
+      await loadInstitutionHistory(address);
       setIssueForm(emptyIssueForm);
       setMessage(`Certificate issued by ${address}.`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Issuance failed");
     } finally {
       setLoading(false);
+    }
+
+  }
+
+  async function loadInstitutionHistory(
+    issuer = institutionAddress,
+    connectedAddress = walletAddress,
+  ) {
+    if (!issuer.trim()) return;
+    try {
+      if (
+        !connectedAddress ||
+        issuer.toLowerCase() !== connectedAddress.toLowerCase()
+      ) {
+        return;
+      }
+      const [approved, historyResponse] = await Promise.all([
+        readInstitutionApproval(issuer.trim()),
+        fetch(`/api/certificates?issuer=${encodeURIComponent(issuer.trim())}`),
+      ]);
+      const historyData = await historyResponse.json();
+      if (!historyResponse.ok) throw new Error(historyData.error ?? "Unable to load certificate history");
+      setInstitutionStatus(approved);
+      setInstitutionHistory(historyData.certificates);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Unable to load institution data");
     }
   }
 
@@ -185,11 +266,22 @@ function App() {
     setMessage("");
 
     try {
+      if (!window.ethereum || !walletAddress) {
+        throw new Error("Connect the issuing institution wallet first.");
+      }
+      const provider = new BrowserProvider(window.ethereum);
+      const signer = await provider.getSigner();
+      const contract = new Contract(
+        import.meta.env.VITE_CONTRACT_ADDRESS,
+        registryAbi,
+        signer,
+      );
+      const transaction = await contract.revokeCertificate(
+        `0x${issuedCertificate.id}`,
+      );
+      await transaction.wait();
       const response = await fetch(
-        `/api/certificates/${issuedCertificate.id}/revoke`,
-        {
-          method: "POST",
-        },
+        `/api/certificates/${issuedCertificate.id}/verify`,
       );
       const data = await response.json();
       if (!response.ok) throw new Error(data.error ?? "Revocation failed");
@@ -199,6 +291,95 @@ function App() {
       setMessage(error instanceof Error ? error.message : "Revocation failed");
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function loadAdministrator() {
+      setAdminMessage("");
+      try {
+        const response = await fetch("/api/admin", adminRequestInit());
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error ?? "Unable to load admin");
+        setAdministrator(data.administrator);
+        const activityResponse = await fetch(
+          "/api/admin/activity",
+          adminRequestInit(),
+        );
+        const activityData = await activityResponse.json();
+        if (!activityResponse.ok) {
+          throw new Error(activityData.error ?? "Unable to load activity");
+        }
+        setActivity(activityData.activity);
+      } catch (error) {
+        setAdminMessage(
+          error instanceof Error ? error.message : "Unable to load admin",
+        );
+      }
+    }
+
+  async function checkInstitution() {
+      setAdminMessage("");
+      setInstitutionApproved(null);
+      try {
+        const response = await fetch(
+          `/api/admin/institutions/${encodeURIComponent(institutionAddress.trim())}`,
+          adminRequestInit(),
+        );
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error ?? "Unable to check institution");
+        setInstitutionApproved(data.approved);
+        setAdminTransaction(data.transaction ?? null);
+      } catch (error) {
+        setAdminMessage(
+          error instanceof Error ? error.message : "Unable to check institution",
+        );
+      }
+    }
+
+  async function updateInstitution(approved: boolean) {
+      setLoading(true);
+      setAdminMessage("");
+      try {
+        if (!window.ethereum) throw new Error("MetaMask is required for admin actions.");
+        const provider = new BrowserProvider(window.ethereum);
+        const signer = await provider.getSigner();
+        const adminWallet = await signer.getAddress();
+        if (adminWallet.toLowerCase() !== administrator.toLowerCase()) {
+          throw new Error("Connected wallet is not the administrator.");
+        }
+        const contract = new Contract(
+          import.meta.env.VITE_CONTRACT_ADDRESS,
+          registryAbi,
+          signer,
+        );
+        const transaction = await contract.setInstitutionApproval(
+          institutionAddress.trim(),
+          approved,
+        );
+        const receipt = await transaction.wait();
+        setAdminTransaction({
+          hash: transaction.hash,
+          blockNumber: receipt.blockNumber,
+          contractAddress: import.meta.env.VITE_CONTRACT_ADDRESS,
+        });
+        setInstitutionApproved(approved);
+        setAdminMessage(
+          approved
+            ? "Institution approved successfully."
+            : "Institution approval removed.",
+        );
+        const activityResponse = await fetch(
+          "/api/admin/activity",
+          adminRequestInit(),
+        );
+        const activityData = await activityResponse.json();
+        if (activityResponse.ok) setActivity(activityData.activity);
+      } catch (error) {
+        setAdminMessage(
+          error instanceof Error ? error.message : "Unable to update institution",
+        );
+      } finally {
+        setLoading(false);
     }
   }
 
@@ -237,9 +418,22 @@ function App() {
           </button>
           <button
             className={view === "issue" ? "tab active" : "tab"}
-            onClick={() => setView("issue")}
+            onClick={() => {
+              setView("issue");
+              setInstitutionStatus(null);
+              setInstitutionHistory([]);
+            }}
           >
             Institution portal
+          </button>
+          <button
+            className={view === "admin" ? "tab active" : "tab"}
+            onClick={() => {
+              setView("admin");
+              void loadAdministrator();
+            }}
+          >
+            Admin controls
           </button>
         </nav>
 
@@ -267,17 +461,33 @@ function App() {
                 </button>
               </div>
             </form>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => setScannerOpen((open) => !open)}
+            >
+              {scannerOpen ? "Close QR scanner" : "Scan QR code"}
+            </button>
+            {scannerOpen && (
+              <QrScanner
+                onScan={(id) => {
+                  setScannerOpen(false);
+                  setCertificateId(id);
+                  void verifyCertificate(id);
+                }}
+              />
+            )}
             {message && <p className="message error">{message}</p>}
             {verification && <VerificationCard result={verification} />}
           </div>
-        ) : (
+        ) : view === "issue" ? (
           <div className="panel issue-panel">
             <div className="panel-heading">
               <p className="section-number">02 / INSTITUTION PORTAL</p>
               <h2>Issue a new credential.</h2>
               <p>
-                Create a certificate record. MetaMask can sign it directly; if
-                MetaMask is unavailable, local demo mode uses the backend wallet.
+                Only an approved institution wallet connected through MetaMask
+                can issue a certificate.
               </p>
             </div>
             <button
@@ -293,6 +503,13 @@ function App() {
                 ? `Connected: ${walletAddress.slice(0, 6)}...${walletAddress.slice(-4)}`
                 : "Connect MetaMask"}
             </button>
+            <p className={`approval-status ${institutionStatus ? "approved" : "not-approved"}`}>
+              {walletAddress
+                ? institutionStatus
+                  ? "Connected wallet is an approved institution."
+                  : "Connected wallet is not approved."
+                : "Connect an approved institution wallet to continue."}
+            </p>
             <form onSubmit={issue} className="issue-form">
               <label>
                 Skill or course name
@@ -362,7 +579,10 @@ function App() {
                   }
                 />
               </label>
-              <button className="primary-button full-width" disabled={loading}>
+              <button
+                className="primary-button full-width"
+                disabled={loading || !walletAddress || !institutionStatus}
+              >
                 {loading ? "Issuing..." : "Issue certificate"}
               </button>
             </form>
@@ -370,6 +590,97 @@ function App() {
             {issuedCertificate && (
               <IssuedCard certificate={issuedCertificate} onRevoke={revoke} />
             )}
+            <CertificateHistory certificates={institutionHistory} />
+          </div>
+        ) : (
+          <div className="panel admin-panel">
+            <div className="panel-heading">
+              <p className="section-number">03 / ADMIN CONTROLS</p>
+              <h2>Manage trusted institutions.</h2>
+              <p>
+                The administrator can approve institutions before they issue
+                certificates. Changes are recorded by the smart contract.
+              </p>
+            </div>
+            <div className="result-card">
+              <div className="result-top">
+                <span className="status-pill">ADMINISTRATOR</span>
+                <span>Contract role</span>
+              </div>
+              <code>{administrator || "Loading..."}</code>
+            </div>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => void connectWallet().catch((error) =>
+                setAdminMessage(
+                  error instanceof Error ? error.message : "Wallet connection failed",
+                ),
+              )}
+            >
+              {walletAddress
+                ? `Connected wallet: ${walletAddress.slice(0, 6)}...${walletAddress.slice(-4)}`
+                : "Connect administrator wallet"}
+            </button>
+            <form
+              className="admin-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void checkInstitution();
+              }}
+            >
+              <label htmlFor="institution-address">Institution wallet address</label>
+              <div className="input-row">
+                <input
+                  id="institution-address"
+                  value={institutionAddress}
+                  onChange={(event) => setInstitutionAddress(event.target.value)}
+                  placeholder="0x..."
+                />
+                <button className="secondary-button" disabled={loading}>
+                  Check status
+                </button>
+              </div>
+            </form>
+            {institutionApproved !== null && (
+              <p className={`approval-status ${institutionApproved ? "approved" : "not-approved"}`}>
+                {institutionApproved ? "Approved institution" : "Not approved"}
+              </p>
+            )}
+            <div className="admin-actions">
+              <button
+                className="primary-button"
+                disabled={loading || !institutionAddress.trim()}
+                onClick={() => void updateInstitution(true)}
+              >
+                {loading ? "Updating..." : "Approve institution"}
+              </button>
+              <button
+                className="danger-button"
+                disabled={loading || !institutionAddress.trim()}
+                onClick={() => void updateInstitution(false)}
+              >
+                Remove approval
+              </button>
+            </div>
+            {adminMessage && <p className="message">{adminMessage}</p>}
+            {adminTransaction && <TransactionDetails transaction={adminTransaction} />}
+            <ActivityFeed
+              activity={activity}
+              typeFilter={activityType}
+              search={activitySearch}
+              onTypeFilterChange={setActivityType}
+              onSearchChange={setActivitySearch}
+            />
+            {institutionApproved !== null && (
+              <button
+                className="secondary-button history-button"
+                onClick={() => void loadInstitutionHistory(institutionAddress)}
+              >
+                Refresh institution history
+              </button>
+            )}
+            <CertificateHistory certificates={institutionHistory} />
           </div>
         )}
       </section>
@@ -423,6 +734,8 @@ function IssuedCard({
   certificate: Certificate;
   onRevoke: () => void;
 }) {
+  const verificationUrl = `${window.location.origin}/?certificateId=${encodeURIComponent(certificate.id)}`;
+
   return (
     <article className="result-card issued-card">
       <div className="result-top">
@@ -432,6 +745,13 @@ function IssuedCard({
         <span>Certificate ID generated</span>
       </div>
       <code>{certificate.id}</code>
+      <div className="qr-card">
+        <p>Scan to verify this certificate</p>
+        <QRCodeCanvas value={verificationUrl} size={180} includeMargin />
+        <a href={verificationUrl} target="_blank" rel="noreferrer">
+          Open verification link
+        </a>
+      </div>
       <button
         className="danger-button"
         onClick={onRevoke}
@@ -439,7 +759,158 @@ function IssuedCard({
       >
         Revoke certificate
       </button>
+      {certificate.transaction && (
+        <TransactionDetails transaction={certificate.transaction} />
+      )}
     </article>
+  );
+}
+
+function CertificateHistory({ certificates }: { certificates: Certificate[] }) {
+  if (!certificates.length) return null;
+  return (
+    <section className="history">
+      <h3>Certificate history</h3>
+      {certificates.map((certificate) => (
+        <div className="history-row" key={certificate.id}>
+          <span>{certificate.skillName}</span>
+          <span>{certificate.revokedAt ? "REVOKED" : "ACTIVE"}</span>
+          <code>{certificate.id}</code>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function TransactionDetails({ transaction }: { transaction: TransactionInfo }) {
+  return (
+    <div className="transaction-details">
+      <strong>Blockchain transaction</strong>
+      <span>Block {transaction.blockNumber}</span>
+      <code>{transaction.hash}</code>
+      <small>Contract: {transaction.contractAddress}</small>
+    </div>
+  );
+}
+
+function ActivityFeed({
+  activity,
+  typeFilter,
+  search,
+  onTypeFilterChange,
+  onSearchChange,
+}: {
+  activity: ActivityEvent[];
+  typeFilter: "ALL" | ActivityEvent["type"];
+  search: string;
+  onTypeFilterChange: (value: "ALL" | ActivityEvent["type"]) => void;
+  onSearchChange: (value: string) => void;
+}) {
+  const normalizedSearch = search.trim().toLowerCase();
+  const filteredActivity = activity.filter((event) => {
+    if (typeFilter !== "ALL" && event.type !== typeFilter) return false;
+    if (!normalizedSearch) return true;
+    return [
+      event.institution,
+      event.certificateId,
+      event.actor,
+      event.transaction.hash,
+    ]
+      .filter(Boolean)
+      .some((value) => value!.toLowerCase().includes(normalizedSearch));
+  });
+
+  return (
+    <section className="activity-feed">
+      <div className="result-top">
+        <h3>Administrator activity</h3>
+        <span>
+          {filteredActivity.length} of {activity.length} events
+        </span>
+      </div>
+      <div className="activity-filters">
+        <label>
+          Event type
+          <select
+            value={typeFilter}
+            onChange={(event) =>
+              onTypeFilterChange(
+                event.target.value as "ALL" | ActivityEvent["type"],
+              )
+            }
+          >
+            <option value="ALL">All events</option>
+            <option value="INSTITUTION_APPROVAL">Institution approvals</option>
+            <option value="CERTIFICATE_ISSUED">Certificate issuance</option>
+            <option value="CERTIFICATE_REVOKED">Certificate revocations</option>
+          </select>
+        </label>
+        <label>
+          Search address, ID, or transaction
+          <input
+            value={search}
+            onChange={(event) => onSearchChange(event.target.value)}
+            placeholder="Search activity"
+          />
+        </label>
+      </div>
+      {!filteredActivity.length ? (
+        <p className="muted">No blockchain activity recorded yet.</p>
+      ) : (
+        filteredActivity.map((event) => (
+          <div className="activity-row" key={`${event.transaction.hash}-${event.type}`}>
+            <strong>
+              {event.type === "INSTITUTION_APPROVAL"
+                ? `Institution ${event.approved ? "approved" : "removed"}`
+                : event.type === "CERTIFICATE_ISSUED"
+                  ? "Certificate issued"
+                  : "Certificate revoked"}
+            </strong>
+            <span>{new Date(event.timestamp).toLocaleString()}</span>
+            <code>{event.institution ?? event.certificateId ?? event.actor}</code>
+            <small>Block {event.transaction.blockNumber} · {event.transaction.hash}</small>
+          </div>
+        ))
+      )}
+    </section>
+  );
+}
+
+function QrScanner({ onScan }: { onScan: (certificateId: string) => void }) {
+  useEffect(() => {
+    const scanner = new Html5Qrcode("certificate-qr-reader");
+    let stopped = false;
+
+    void scanner
+      .start(
+        { facingMode: "environment" },
+        { fps: 10, qrbox: { width: 250, height: 250 } },
+        (decodedText) => {
+          try {
+            const url = new URL(decodedText);
+            const id = url.searchParams.get("certificateId");
+            if (id) onScan(id);
+          } catch {
+            onScan(decodedText);
+          }
+        },
+        () => undefined,
+      )
+      .catch(() => undefined);
+
+    return () => {
+      if (!stopped) {
+        stopped = true;
+        void scanner.stop().catch(() => undefined);
+      }
+    };
+  }, [onScan]);
+
+  return (
+    <div className="qr-scanner">
+      <p>Allow camera access and point it at a certificate QR code.</p>
+      <div id="certificate-qr-reader" />
+    </div>
   );
 }
 
